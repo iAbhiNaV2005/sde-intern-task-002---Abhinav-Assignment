@@ -59,4 +59,3 @@ export async function payShare(
   // Already paid with another key
   throw new AppError(409, 'Share has already been paid with a different idempotency key')
 }
-

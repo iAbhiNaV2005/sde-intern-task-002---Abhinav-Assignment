@@ -30,4 +30,3 @@ export function splitCents(totalCents: number, memberCount: number): number[] {
 
   return shares
 }
-

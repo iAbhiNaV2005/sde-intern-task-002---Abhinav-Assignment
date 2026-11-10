@@ -85,4 +85,3 @@ export async function listBillsByHome(db: D1Database, homeId: string): Promise<B
     shares: sharesByBill[b.id] ?? [],
   }))
 }
-

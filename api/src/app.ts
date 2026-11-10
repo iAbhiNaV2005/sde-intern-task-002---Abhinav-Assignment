@@ -30,4 +30,3 @@ export function createApp(): Hono<AppEnv> {
 
   return app
 }
-

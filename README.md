@@ -1,185 +1,146 @@
 # SDE Intern Assignment: Shared Bill Splitter
 
-Welcome. In this assignment you build a small bill splitter for a shared home. It has two parts:
+A production-grade, concurrency-safe bill-splitting web application and API built for shared homes. It calculates exact integer cent bill splits, distributes remainders deterministically based on member join order, handles concurrent payments safely, and guarantees idempotent retries.
 
-1. **Homes and members:** create a home and add members to it.
-2. **Bill splitting:** split a bill between the members. Each member pays their own share.
+---
 
-The assignment is small on purpose. We want correct, safe, and clear code. We do not want many features.
+## Architecture Overview
 
-## What we look at
+```
+ Browser (React 19 + Vite + TanStack Router)
+    │
+    │  fetch JSON (/api/* proxied via Vite to :8787)
+    ▼
+ Cloudflare Worker (Hono API)
+    ├── Middleware  : Global JSON error handler, JSON 404 handler
+    ├── Validation  : Zero-dependency runtime input validators (400 vs 422)
+    ├── Domain      : splitCents(totalCents, memberCount)  [Pure logic & sum invariant]
+    ├── Data Access : Prepared statements with parameterized bindings
+    │
+    │  D1 Binding "DB"
+    ▼
+ Cloudflare D1 (SQLite Database)
+    └── 0001_init.sql with 8 named integrity constraints
+```
 
-- **Your code passes the tests.** The tests decide, not opinion. You get the visible tests. We also run extra tests that you do not see.
-- **Your code is safe when things go wrong.** Wrong input, repeated requests, and two requests at the same time must not break your data.
-- **Your code is typed.** Use TypeScript. Do not use `any`.
-- **You understand your code.** You record a short video and explain it.
+### Architectural Principles
 
-Take your time. A careful, correct solution is better than a fast one. We expect 2 to 3 days of real work.
+1. **Database as the Ultimate Line of Defense**: Named constraints prevent invalid state (negative money, duplicate shares, orphan records, half-paid states) even if application code is bypassed.
+2. **Atomic Mutations**:
+   - Bill & share creation is executed as a single all-or-nothing D1 batch transaction.
+   - Share payment is executed as a single conditional `UPDATE ... WHERE paid_at IS NULL RETURNING ...` statement, eliminating race conditions under concurrency.
+3. **Pure Domain Logic**: The split calculation is isolated from I/O, completely deterministically distributing remainder cents to the earliest members in join order (`seq`), and asserting the invariant `sum(shares) === totalCents`.
+4. **Pessimistic UI with Stable Idempotency**: The UI preserves unpaid state until the API returns HTTP 200. Retries reuse the identical `Idempotency-Key` UUID.
 
-## Stack (required)
+---
 
-- **API:** Hono on Cloudflare Workers
-- **Database:** Cloudflare D1 (SQLite). The binding is `DB` in `api/wrangler.jsonc`.
-- **Web:** React, Vite, TanStack Router
-- **Language:** TypeScript on both sides
-- **Tests:** Vitest, running inside the Workers runtime
-- **Quality:** Biome. `pnpm check` and `pnpm typecheck` must pass.
+## Database Design & Named Constraints
 
-You choose the rest (styling, form library, validation library). Pick tools you can explain.
+The schema is defined in `api/migrations/0001_init.sql`.
 
-## The task
+| Constraint Name             | Type                        | Purpose & Protection                                                                               |
+| :-------------------------- | :-------------------------- | :------------------------------------------------------------------------------------------------- |
+| `ck_bills_total_positive`   | CHECK                       | Prevents zero or negative bill amounts (`total_cents > 0`).                                        |
+| `ck_shares_amount_nonneg`   | CHECK                       | Prevents negative share amounts (`amount_cents >= 0`).                                             |
+| `uq_shares_bill_member`     | UNIQUE (bill_id, member_id) | Prevents duplicate shares for the same member in a bill.                                           |
+| `ck_shares_paid_consistent` | CHECK                       | Prevents half-paid states (`paid_at` and `payment_key` must be either both NULL or both NOT NULL). |
+| `ck_homes_name_not_blank`   | CHECK                       | Disallows empty or whitespace-only home names.                                                     |
+| `ck_members_name_not_blank` | CHECK                       | Disallows empty or whitespace-only member names.                                                   |
+| `ck_bills_title_not_blank`  | CHECK                       | Disallows empty or whitespace-only bill titles.                                                    |
+| `fk_members_home`           | Foreign Key                 | Ensures members belong to a valid home.                                                            |
+| `fk_bills_home`             | Foreign Key                 | Ensures bills belong to a valid home.                                                              |
+| `fk_shares_bill`            | Foreign Key                 | Ensures shares belong to a valid bill.                                                             |
+| `fk_shares_member`          | Foreign Key                 | Ensures shares reference a valid member.                                                           |
 
-The assignment has two parts. Do Part 1 first. Part 2 builds on it.
+_Note on member ordering:_ Members are assigned an internal auto-incrementing `seq` column (`INTEGER PRIMARY KEY AUTOINCREMENT`) alongside a public UUID `id`. Sorting by `seq ASC` guarantees deterministic join order even if multiple members are inserted in the same millisecond.
 
-**Database.** Write the schema as SQL migration files in `api/migrations/`. For example `0001_init.sql`. The tests apply every file in this folder. Your schema must have **at least 3 named constraints** that protect the data. For example a foreign key, a `CHECK`, or a `UNIQUE` key. Be ready to explain what each constraint stops.
+---
 
-**Errors.** Every error response is JSON: `{ "error": "message" }`.
+## API Specifications
 
-## Part 1: Homes and members
+All amounts are integers representing **cents** (`100` cents = $1.00). Decimals are never used in data models or the API.
 
-Create a home and add members to it. The order in which members are added matters in Part 2.
+All error responses strictly return JSON: `{ "error": "message" }`.
 
-#### `POST /api/homes`
+### Endpoints
 
-- Request: `{ "name": string }`
-- Success: `201` `{ id, name }`
+| Method | Endpoint                                 | Success Status                                             | Errors        | Description                                                |
+| :----- | :--------------------------------------- | :--------------------------------------------------------- | :------------ | :--------------------------------------------------------- |
+| `POST` | `/api/homes`                             | `201 { id, name }`                                         | 400, 422      | Creates a home.                                            |
+| `POST` | `/api/homes/:homeId/members`             | `201 { id, homeId, name }`                                 | 404, 422      | Adds a member to a home.                                   |
+| `POST` | `/api/homes/:homeId/bills`               | `201 { id, homeId, title, totalCents, shares }`            | 404, 422      | Splits bill between members and creates shares in 1 batch. |
+| `POST` | `/api/bills/:billId/shares/:shareId/pay` | `200 { id, memberId, amountCents, paidAt }`                | 400, 404, 409 | Pays a share using `Idempotency-Key` header.               |
+| `GET`  | `/api/homes/:homeId/balances`            | `200 { balances: [{ memberId, name, outstandingCents }] }` | 404           | Returns unpaid totals per member in join order.            |
+| `GET`  | `/api/homes/:homeId`                     | `200 { id, name, members }`                                | 404           | Reads home details and members list.                       |
+| `GET`  | `/api/homes/:homeId/bills`               | `200 { bills }`                                            | 404           | Lists bills and shares (newest first).                     |
+| `GET`  | `/api/health`                            | `200 { status: "ok" }`                                     | -             | Health check endpoint.                                     |
 
-#### `POST /api/homes/:homeId/members`
+---
 
-- Request: `{ "name": string }`
-- Success: `201` `{ id, homeId, name }`
-- Errors: `404` home not found
+## Edge Cases Handled
 
-Visible tests: `api/test/homes.test.ts`.
+1. **Home with no members:** When creating a bill, the API checks member count and returns `422` with no bill created.
+2. **Invalid bill totals:** Rejects `0`, negative numbers, decimals (`10.5`), strings (`"1000"`), and `null` with `422`.
+3. **Uneven cent division:** e.g., $10.00 (1000 cents) across 3 members cleanly splits as `[334, 333, 333]` with the remainder cent awarded to the earliest registered member.
+4. **Duplicate payment attempts (Same key):** Replaying the same `Idempotency-Key` returns `200` with the original `paidAt` timestamp without re-charging.
+5. **Concurrent payments (Different keys):** 10 concurrent requests on the same share yield exactly one `200` and nine `409 Conflict` responses.
+6. **Nonexistent / mismatched entities:** Nonexistent homes, bills, or shares return `404`. A share accessed under the wrong bill ID returns `404`.
+7. **Network timeouts & 500 crashes:** The web client implements a 10s timeout, handles non-JSON proxy errors, and presents retry buttons without unmounting or crashing the UI.
 
-## Part 2: Bill splitting
+---
 
-Add a bill to a home, split it between the members, and let each member pay their share.
+## Decisions
 
-All amounts are whole **cents** (integers). `100` cents is 1 dollar. Never use decimals for money.
+1. **Integrity lives in the database and in atomic statements.**
+   - _What was chosen:_ We implemented 8 explicit named constraints (`fk_*`, `ck_*`, `uq_*`) combined with a single conditional `UPDATE ... WHERE paid_at IS NULL RETURNING ...` query and an all-or-nothing D1 batch transaction for bill/share insertion.
+   - _Why:_ Even if application code has bugs or high-frequency concurrent requests occur, the database serializes writes and prevents invalid data states without requiring distributed locking or complex read-then-write code. Two concurrent payments for the same share will always result in exactly one write succeeding and one receiving a conflict.
 
-#### `POST /api/homes/:homeId/bills`
+2. **Idempotency key stored directly on the share record.**
+   - _What was chosen:_ Instead of introducing an auxiliary idempotency table or external cache, `payment_key` is stored directly as a column on the `shares` table.
+   - _Why:_ A share transitions from unpaid to paid exactly once in its lifecycle. Storing the key on the share row guarantees atomic updates, eliminates multi-table synchronization bugs, and makes payment replays trivially deterministic: if the same key is received, the server returns the existing row with its original `paidAt` timestamp.
 
-- Request: `{ "title": string, "totalCents": number }`
-- Success: `201` `{ id, homeId, title, totalCents, shares: [{ id, memberId, amountCents, paidAt: null }] }`
-- Errors: `404` home not found. `422` total is not a positive whole number, or the home has no members.
+3. **Integer cents throughout, paired with a pure, invariant-tested `splitCents` function.**
+   - _What was chosen:_ Money is strictly represented and transmitted as integer cents (no floating-point numbers). The distribution logic is implemented in a pure domain function `splitCents(totalCents, memberCount)`.
+   - _Why:_ Completely avoids IEEE-754 floating-point rounding errors. Remainder cents are allocated sequentially to members in join order (`seq`), and an assertion strictly verifies `sum(shares) === totalCents` before any transaction is executed.
 
-#### `POST /api/bills/:billId/shares/:shareId/pay`
+---
 
-- Request: header `Idempotency-Key`
-- Success: `200` `{ id, memberId, amountCents, paidAt }`
-- Errors: `400` key missing. `404` bill or share not found. `409` share already paid with a different key.
+## Local Development & Testing
 
-#### `GET /api/homes/:homeId/balances`
+This is a `pnpm` monorepo. No API keys or external services are needed. Everything runs locally with Miniflare and SQLite.
 
-- Success: `200` `{ balances: [{ memberId, name, outstandingCents }] }`
-- Errors: `404` home not found
-
-**Rules**
-
-- **Split.** A bill is split between all members of the home. The shares always add up to `totalCents`. If the amount does not divide evenly, the extra cents go to the members one by one, in the order the members were added to the home. Example: 1000 cents between 3 members gives `334`, `333`, `333`.
-- **Pay.** Paying marks one share as paid and sets `paidAt`. If the same `Idempotency-Key` is sent again for the same share, answer `200` with the same result. Do not pay twice. If two requests pay the same share at the same time, only one may succeed.
-- **Balances.** `outstandingCents` is the sum of the member's unpaid shares, across all bills of the home. List the members in the order they were added.
-
-Visible tests: `api/test/bills.test.ts` and `api/test/payments.test.ts`.
-
-#### Web page
-
-Build one page that:
-
-- shows the bills of a home and the shares of each bill,
-- lets a member pay a share,
-- shows clear **loading**, **empty**, and **error** states,
-- keeps the share unpaid and shows an error if the payment fails.
-
-The page must not crash when the API answers with an error or is slow.
-
-## Cases you must handle
-
-You must handle these cases and talk about them in your video:
-
-1. A home with no members.
-2. An amount that is zero, negative, or not a whole number.
-3. An amount that does not divide evenly.
-4. The same payment request sent twice.
-5. Two members paying the same share at the same time.
-6. A bill or share that does not exist.
-7. The API answers with a 500 error or is slow. The web page must not crash.
-
-## Run it
-
-This is a pnpm workspace. Install once at the root.
+### 1. Install Dependencies
 
 ```bash
 pnpm install
-pnpm dev          # api on :8787 and web on :5173
 ```
 
-Open http://localhost:5173. The starter page shows a title. `/api/health` returns `{ "status": "ok" }`.
+### 2. Run All Tests
+
+Runs all 37 Vitest tests inside the Cloudflare Workers runtime:
+```bash
+pnpm test
+```
+
+### 3. Run Quality & Type Checks
 
 ```bash
-pnpm test         # run the visible tests in api/test
-pnpm check        # Biome: format and lint. Must pass.
-pnpm check:fix    # fix what Biome can fix
-pnpm typecheck    # tsc on both packages. Must pass.
-pnpm build        # production build of the web app
+pnpm check       # Biome formatting and linter check (must pass)
+pnpm typecheck   # TypeScript compiler check on api and web (must pass)
+pnpm build       # Production build of the web app
 ```
 
-`pnpm dev` applies your migrations to a local database before it starts the API.
-
-If pnpm says some build scripts were ignored, run `pnpm approve-builds` and allow `esbuild` and `workerd`.
-
-When you change `api/wrangler.jsonc`, refresh the `Env` types:
+### 4. Run Development Server
 
 ```bash
-pnpm --filter bill-splitter-api cf-typegen
+pnpm dev
 ```
 
-## Rules for the tests
+- Web Application: [http://localhost:5173](http://localhost:5173)
+- Hono API: [http://localhost:8787](http://localhost:8787)
 
-- The visible tests are in `api/test`. They start with a failing result. Your job is to make them pass.
-- Do **not** change the visible tests or `api/test/helpers.ts`. We compare them with the original.
-- We run extra tests after you submit. They test the cases in "Cases you must handle" more closely.
+---
 
-## AI policy
+## Additional Resources
 
-You can use AI tools. Tell us which ones and where in your answers on the form.
-You must understand every line you submit. We check this with your video and in a live call. "The AI wrote it" is not an answer.
-
-## Decisions
-
-1. **Integrity lives in the database and in atomic statements.**
-   - _What was chosen:_ We used 7 explicit named constraints (`fk_members_home`, `fk_bills_home`, `fk_shares_bill`, `fk_shares_member`, `ck_bills_total_positive`, `ck_shares_amount_nonneg`, `uq_shares_bill_member`, `ck_shares_paid_consistent`, and non-blank name checks) along with a conditional `UPDATE ... WHERE paid_at IS NULL RETURNING ...` and an all-or-nothing D1 batch transaction for bill/share insertion.
-   - _Why:_ Even if application code has a bug or multiple requests arrive concurrently, the database guarantees consistency without complex locking or distributed transaction coordination. Two concurrent payments for the same share will always result in exactly one write succeeding and one seeing the committed result.
-
-2. **Idempotency key stored directly on the share record.**
-   - _What was chosen:_ Instead of introducing a separate idempotency key table or external cache, `payment_key` is a column directly on the `shares` table.
-   - _Why:_ A share can only ever transition from unpaid to paid once in its lifetime. Storing the key directly on the share row avoids maintaining a second source of truth, avoids multi-table synchronization bugs, and makes payment replays trivially deterministic: if a payment with the same key is replayed, the server returns the existing row with its original `paidAt` timestamp.
-
-3. **Integer cents throughout, paired with a pure, invariant-tested `splitCents` function.**
-   - _What was chosen:_ Money is strictly stored, transmitted, and computed as integer cents (no floating-point numbers). The distribution logic is implemented in a pure domain function `splitCents(totalCents, memberCount)`.
-   - _Why:_ Eliminates IEEE-754 floating-point rounding errors entirely. Remainder cents are distributed sequentially to members in join order (`seq`), and an assertion verifies `sum(shares) === totalCents` before any database write is committed.
-
-## Decisions
-
-1. **Integrity lives in the database and in atomic statements.**
-   - *What was chosen:* We used 7 explicit named constraints (`fk_members_home`, `fk_bills_home`, `fk_shares_bill`, `fk_shares_member`, `ck_bills_total_positive`, `ck_shares_amount_nonneg`, `uq_shares_bill_member`, `ck_shares_paid_consistent`, and non-blank name checks) along with a conditional `UPDATE ... WHERE paid_at IS NULL RETURNING ...` and an all-or-nothing D1 batch transaction for bill/share insertion.
-   - *Why:* Even if application code has a bug or multiple requests arrive concurrently, the database guarantees consistency without complex locking or distributed transaction coordination. Two concurrent payments for the same share will always result in exactly one write succeeding and one seeing the committed result.
-
-2. **Idempotency key stored directly on the share record.**
-   - *What was chosen:* Instead of introducing a separate idempotency key table or external cache, `payment_key` is a column directly on the `shares` table.
-   - *Why:* A share can only ever transition from unpaid to paid once in its lifetime. Storing the key directly on the share row avoids maintaining a second source of truth, avoids multi-table synchronization bugs, and makes payment replays trivially deterministic: if a payment with the same key is replayed, the server returns the existing row with its original `paidAt` timestamp.
-
-3. **Integer cents throughout, paired with a pure, invariant-tested `splitCents` function.**
-   - *What was chosen:* Money is strictly stored, transmitted, and computed as integer cents (no floating-point numbers). The distribution logic is implemented in a pure domain function `splitCents(totalCents, memberCount)`.
-   - *Why:* Eliminates IEEE-754 floating-point rounding errors entirely. Remainder cents are distributed sequentially to members in join order (`seq`), and an assertion verifies `sum(shares) === totalCents` before any database write is committed.
-
-## How to submit
-
-1. Click **Use this template**, then **Create a new repository**. Make the repository **public**.
-2. Build your solution in your new repository. Small, clear commits are welcome.
-3. Update this README with a short section called **Decisions**. Write 3 decisions you made and why.
-4. Record a video of **3 minutes or less** (Loom or unlisted YouTube). Show the architecture, the data flow, and one trade-off you made. Make sure anyone with the link can view it.
-5. Paste the repository link and the video link in the application form.
-
-We will run `pnpm install && pnpm check && pnpm typecheck && pnpm test` on your repository.
+- [VIDEO_GUIDE.md](./VIDEO_GUIDE.md): Word-for-word 3-minute video presentation script and answers for live technical interview questions.

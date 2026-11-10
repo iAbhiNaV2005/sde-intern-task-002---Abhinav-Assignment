@@ -56,4 +56,3 @@ homesRouter.get('/api/homes/:homeId', async (c) => {
     members: members.map((m) => ({ id: m.id, name: m.name })),
   })
 })
-

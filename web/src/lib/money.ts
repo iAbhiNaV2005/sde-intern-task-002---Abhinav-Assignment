@@ -35,4 +35,3 @@ export function parseDollarsToCents(input: string): number | null {
 
   return cents
 }
-

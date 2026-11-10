@@ -52,4 +52,3 @@ billsRouter.get('/api/homes/:homeId/bills', async (c) => {
   const bills = await listBillsByHome(c.env.DB, homeId)
   return c.json({ bills }, 200)
 })
-

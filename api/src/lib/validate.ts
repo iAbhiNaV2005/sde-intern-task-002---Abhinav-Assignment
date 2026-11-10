@@ -75,4 +75,3 @@ export function validateIdempotencyKey(header: string | undefined): string {
   }
   return trimmed
 }
-

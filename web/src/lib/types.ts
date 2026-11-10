@@ -29,4 +29,3 @@ export type Balance = {
   name: string
   outstandingCents: number
 }
-

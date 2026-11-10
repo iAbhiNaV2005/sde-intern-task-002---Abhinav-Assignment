@@ -60,4 +60,3 @@ describe('splitCents domain logic', () => {
     expect(() => splitCents(100, 1.5)).toThrow()
   })
 })
-

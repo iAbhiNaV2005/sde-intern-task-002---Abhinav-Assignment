@@ -80,4 +80,3 @@ export type BalanceItem = {
 export type BalanceResponse = {
   balances: BalanceItem[]
 }
-

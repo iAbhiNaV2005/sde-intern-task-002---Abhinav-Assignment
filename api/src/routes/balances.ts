@@ -10,4 +10,3 @@ balancesRouter.get('/api/homes/:homeId/balances', async (c) => {
 
   return c.json({ balances }, 200)
 })
-
