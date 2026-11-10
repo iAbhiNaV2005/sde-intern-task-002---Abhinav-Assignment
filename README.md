@@ -146,6 +146,34 @@ pnpm --filter bill-splitter-api cf-typegen
 You can use AI tools. Tell us which ones and where in your answers on the form.
 You must understand every line you submit. We check this with your video and in a live call. "The AI wrote it" is not an answer.
 
+## Decisions
+
+1. **Integrity lives in the database and in atomic statements.**
+   - _What was chosen:_ We used 7 explicit named constraints (`fk_members_home`, `fk_bills_home`, `fk_shares_bill`, `fk_shares_member`, `ck_bills_total_positive`, `ck_shares_amount_nonneg`, `uq_shares_bill_member`, `ck_shares_paid_consistent`, and non-blank name checks) along with a conditional `UPDATE ... WHERE paid_at IS NULL RETURNING ...` and an all-or-nothing D1 batch transaction for bill/share insertion.
+   - _Why:_ Even if application code has a bug or multiple requests arrive concurrently, the database guarantees consistency without complex locking or distributed transaction coordination. Two concurrent payments for the same share will always result in exactly one write succeeding and one seeing the committed result.
+
+2. **Idempotency key stored directly on the share record.**
+   - _What was chosen:_ Instead of introducing a separate idempotency key table or external cache, `payment_key` is a column directly on the `shares` table.
+   - _Why:_ A share can only ever transition from unpaid to paid once in its lifetime. Storing the key directly on the share row avoids maintaining a second source of truth, avoids multi-table synchronization bugs, and makes payment replays trivially deterministic: if a payment with the same key is replayed, the server returns the existing row with its original `paidAt` timestamp.
+
+3. **Integer cents throughout, paired with a pure, invariant-tested `splitCents` function.**
+   - _What was chosen:_ Money is strictly stored, transmitted, and computed as integer cents (no floating-point numbers). The distribution logic is implemented in a pure domain function `splitCents(totalCents, memberCount)`.
+   - _Why:_ Eliminates IEEE-754 floating-point rounding errors entirely. Remainder cents are distributed sequentially to members in join order (`seq`), and an assertion verifies `sum(shares) === totalCents` before any database write is committed.
+
+## Decisions
+
+1. **Integrity lives in the database and in atomic statements.**
+   - *What was chosen:* We used 7 explicit named constraints (`fk_members_home`, `fk_bills_home`, `fk_shares_bill`, `fk_shares_member`, `ck_bills_total_positive`, `ck_shares_amount_nonneg`, `uq_shares_bill_member`, `ck_shares_paid_consistent`, and non-blank name checks) along with a conditional `UPDATE ... WHERE paid_at IS NULL RETURNING ...` and an all-or-nothing D1 batch transaction for bill/share insertion.
+   - *Why:* Even if application code has a bug or multiple requests arrive concurrently, the database guarantees consistency without complex locking or distributed transaction coordination. Two concurrent payments for the same share will always result in exactly one write succeeding and one seeing the committed result.
+
+2. **Idempotency key stored directly on the share record.**
+   - *What was chosen:* Instead of introducing a separate idempotency key table or external cache, `payment_key` is a column directly on the `shares` table.
+   - *Why:* A share can only ever transition from unpaid to paid once in its lifetime. Storing the key directly on the share row avoids maintaining a second source of truth, avoids multi-table synchronization bugs, and makes payment replays trivially deterministic: if a payment with the same key is replayed, the server returns the existing row with its original `paidAt` timestamp.
+
+3. **Integer cents throughout, paired with a pure, invariant-tested `splitCents` function.**
+   - *What was chosen:* Money is strictly stored, transmitted, and computed as integer cents (no floating-point numbers). The distribution logic is implemented in a pure domain function `splitCents(totalCents, memberCount)`.
+   - *Why:* Eliminates IEEE-754 floating-point rounding errors entirely. Remainder cents are distributed sequentially to members in join order (`seq`), and an assertion verifies `sum(shares) === totalCents` before any database write is committed.
+
 ## How to submit
 
 1. Click **Use this template**, then **Create a new repository**. Make the repository **public**.

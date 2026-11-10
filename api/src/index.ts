@@ -1,7 +1,5 @@
-import { Hono } from 'hono'
+import { createApp } from './app'
 
-const app = new Hono<{ Bindings: Env }>()
-
-app.get('/api/health', (c) => c.json({ status: 'ok' }))
+const app = createApp()
 
 export default app
